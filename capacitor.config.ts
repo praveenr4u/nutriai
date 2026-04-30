@@ -1,7 +1,7 @@
 import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
-  appId: 'com.nutriai.app',
+  appId: 'com.praveenr4u.nutriai',
   appName: 'NutriAI',
   webDir: 'out',
   server: {

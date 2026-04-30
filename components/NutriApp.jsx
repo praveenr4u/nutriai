@@ -7,6 +7,8 @@ import {
   loadProfile, saveProfile, dbRowToProfile, dbRowToNutrition,
   loadFoodLogs, addFoodLog, deleteFoodLog,
   loadWater, saveWater,
+  loadWeightLogs, logWeight,
+  loadStreak, updateStreak,
 } from '../lib/db';
 
 // ─── INITIAL STATE ────────────────────────────
@@ -33,9 +35,12 @@ export default function NutriApp() {
   const [toast, setToast]           = useState({ msg:'', show:false });
   const [activeTab, setActiveTab]   = useState('home');
   const [planDay, setPlanDay]       = useState(0);
-  const [authModal, setAuthModal]   = useState({ open:false, tab:'login' });
-  const [foodModal, setFoodModal]   = useState({ open:false, meal:null });
+  const [authModal, setAuthModal]     = useState({ open:false, tab:'login' });
+  const [foodModal, setFoodModal]     = useState({ open:false, meal:null });
   const [scannerOpen, setScannerOpen] = useState(false);
+  const [editProfileOpen, setEditProfileOpen] = useState(false);
+  const [streak, setStreak]           = useState({ current_streak:0, longest_streak:0, total_days:0 });
+  const [weightLogs, setWeightLogs]   = useState([]);
   const toastTimer = useRef(null);
 
   // ── TOAST ──
@@ -98,13 +103,17 @@ export default function NutriApp() {
       setProfile(restoredProfile);
       setNutrition(restoredNutrition);
 
-      // Load today's food logs and water
-      const [logs, cups] = await Promise.all([
+      // Load today's food logs, water, streak and weight logs
+      const [logs, cups, streakData, weightData] = await Promise.all([
         loadFoodLogs(authUser.id),
         loadWater(authUser.id),
+        loadStreak(authUser.id),
+        loadWeightLogs(authUser.id, 30),
       ]);
       setFoodLog(logs);
       setWaterCups(cups);
+      setStreak(streakData);
+      setWeightLogs(weightData);
 
       setScreen('main');
       setHistory(['main']);
@@ -122,6 +131,24 @@ export default function NutriApp() {
     setNutrition(n);
     return n;
   }, [profile]);
+
+  // ── AUTO-RECALCULATE when profile changes (after onboarding complete) ──
+  useEffect(() => {
+    if (screen === 'main' && profile.goal && profile.activityLevel) {
+      const n = calcNutrition(profile);
+      setNutrition(n);
+      // Persist updated nutrition to DB
+      if (user?.id) {
+        saveProfile(user.id, profile, n, user.name).catch(console.error);
+      }
+    }
+  }, [
+    profile.gender, profile.goal, profile.age,
+    profile.heightFt, profile.heightIn, profile.heightCm, profile.heightUnit,
+    profile.weightLbs, profile.weightKg, profile.weightUnit,
+    profile.targetWeightLbs, profile.targetWeightKg,
+    profile.activityLevel,
+  ]);
 
   const enterApp = useCallback(async () => {
     const n = computeNutrition();
@@ -154,9 +181,13 @@ export default function NutriApp() {
     // Optimistic update
     setFoodLog(fl => ({ ...fl, [meal]: [...fl[meal], food] }));
     showToast(`✅ ${food.name || food.label} added!`);
-    // Save to DB
+    // Save to DB + update streak
     if (user?.id) {
-      const dbId = await addFoodLog(user.id, meal, food);
+      const [dbId, newStreak] = await Promise.all([
+        addFoodLog(user.id, meal, food),
+        updateStreak(user.id),
+      ]);
+      if (newStreak) setStreak(newStreak);
       if (dbId) {
         // Attach dbId so we can delete it later
         setFoodLog(fl => ({
@@ -222,6 +253,20 @@ export default function NutriApp() {
             setTimeout(() => { goTo('gender'); }, 500);
           }}
           showToast={showToast}
+        />
+      )}
+
+      {/* EDIT PROFILE MODAL */}
+      {editProfileOpen && (
+        <EditProfileModal
+          profile={profile}
+          nutrition={nutrition}
+          onClose={() => setEditProfileOpen(false)}
+          onSave={(updatedProfile) => {
+            setProfile(p => ({ ...p, ...updatedProfile }));
+            setEditProfileOpen(false);
+            showToast('✅ Profile updated! Calorie target recalculated.');
+          }}
         />
       )}
 
@@ -336,6 +381,17 @@ export default function NutriApp() {
               }}
               onSignOut={handleSignOut}
               showToast={showToast}
+              onEditProfile={() => setEditProfileOpen(true)}
+              streak={streak}
+              weightLogs={weightLogs}
+              onLogWeight={async (w, unit) => {
+                const updated = [...weightLogs.filter(l => l.log_date !== new Date().toISOString().split('T')[0]),
+                                 { log_date: new Date().toISOString().split('T')[0], weight: w, unit }]
+                  .sort((a,b) => a.log_date.localeCompare(b.log_date));
+                setWeightLogs(updated);
+                if (user?.id) await logWeight(user.id, w, unit);
+                showToast(`⚖️ Weight logged: ${w} ${unit}`);
+              }}
             />
           )}
         </>
@@ -1021,7 +1077,7 @@ function SummaryScreen({ profile, nutrition, onBack, onStart }) {
 // ════════════════════════════════════════════════
 function MainApp({ user, profile, nutrition, foodLog, waterCups, totalCals, totalMacro, mealCals,
   activeTab, planDay, onTabChange, onPlanDayChange, onRemoveFood, onOpenFoodModal, onOpenScanner,
-  onWaterToggle, onSignOut, showToast }) {
+  onWaterToggle, onSignOut, showToast, onEditProfile, streak, weightLogs, onLogWeight }) {
 
   const goalObj = GOALS.find(g => g.id === profile.goal) || GOALS[0];
   const actObj  = ACTIVITIES.find(a => a.id === profile.activityLevel) || ACTIVITIES[1];
@@ -1037,11 +1093,13 @@ function MainApp({ user, profile, nutrition, foodLog, waterCups, totalCals, tota
         <PlanTab nutrition={nutrition} planDay={planDay} onDayChange={onPlanDayChange} />
       )}
       {activeTab === 'insights' && (
-        <InsightsTab nutrition={nutrition} profile={profile} />
+        <InsightsTab nutrition={nutrition} profile={profile}
+          streak={streak} weightLogs={weightLogs} onLogWeight={onLogWeight} />
       )}
       {activeTab === 'profile' && (
         <ProfileTab user={user} profile={profile} nutrition={nutrition}
-          goalObj={goalObj} actObj={actObj} onSignOut={onSignOut} showToast={showToast} />
+          goalObj={goalObj} actObj={actObj} onSignOut={onSignOut} showToast={showToast}
+          onEditProfile={onEditProfile} streak={streak} />
       )}
       <nav className="bottom-nav">
         {[
@@ -1070,6 +1128,36 @@ function MainApp({ user, profile, nutrition, foodLog, waterCups, totalCals, tota
 function HomeTab({ foodLog, nutrition, totalCals, totalMacro, mealCals, waterCups, onRemoveFood, onOpenFoodModal, onWaterToggle }) {
   const remaining = Math.max(0, nutrition.calorieTarget - totalCals);
   const pct = Math.min(100, (totalCals / nutrition.calorieTarget) * 100);
+  const [aiSuggestions, setAiSuggestions] = useState(null);
+  const [aiLoading, setAiLoading]         = useState(false);
+  const [aiExpanded, setAiExpanded]       = useState(false);
+
+  const fetchSuggestions = async () => {
+    setAiLoading(true);
+    setAiExpanded(true);
+    try {
+      const res = await fetch('/api/suggestions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          calorieTarget: nutrition.calorieTarget,
+          caloriesEaten: totalCals,
+          proteinTarget: nutrition.protein,
+          proteinEaten:  totalMacro('protein'),
+          carbsTarget:   nutrition.carbs,
+          carbsEaten:    totalMacro('carbs'),
+          fatTarget:     nutrition.fat,
+          fatEaten:      totalMacro('fat'),
+        }),
+      });
+      const data = await res.json();
+      setAiSuggestions(data);
+    } catch (e) { console.error(e); }
+    setAiLoading(false);
+  };
+
+  // Auto-fetch on mount
+  useEffect(() => { fetchSuggestions(); }, []);
   const today = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
   const meals = ['breakfast','lunch','dinner','snacks'];
   const mealMeta = { breakfast:{icon:'🌅',name:'Breakfast'}, lunch:{icon:'🌞',name:'Lunch'}, dinner:{icon:'🌙',name:'Dinner'}, snacks:{icon:'🍎',name:'Snacks'} };
@@ -1077,20 +1165,42 @@ function HomeTab({ foodLog, nutrition, totalCals, totalMacro, mealCals, waterCup
   return (
     <div className="tab-content">
       <div className="main-header">
-        <div><h1>Today's Nutrition</h1><div className="date">{today}</div></div>
+        <div>
+          <div style={{ fontSize:13, color:'var(--text-mid)', marginBottom:2 }}>
+            {new Date().getHours() < 12 ? 'Good Morning! 🌅' : new Date().getHours() < 17 ? 'Good Afternoon! 🌞' : 'Good Evening! 🌙'}
+          </div>
+          <h1>Daily Nutrition</h1>
+          <div className="date">{today}</div>
+        </div>
         <button className="notif-btn">🔔</button>
       </div>
       <div className="stats-row">
-        <div className="stat-card"><div className="ic-val" style={{color:'var(--green)'}}>{nutrition.calorieTarget}</div><div className="ic-label">Goal</div></div>
-        <div className="stat-card"><div className="ic-val" style={{color:'var(--green)'}}>{totalCals}</div><div className="ic-label">Eaten</div></div>
-        <div className="stat-card"><div className="ic-val" style={{color:remaining>0?'var(--green)':'var(--red)'}}>{remaining}</div><div className="ic-label">Remaining</div></div>
+        <div className="stat-card stat-card-orange">
+          <div className="sc-icon">🔥</div>
+          <div className="sc-label">Calories</div>
+          <div className="sc-val">{totalCals}</div>
+          <div className="sc-sub">/ {nutrition.calorieTarget} kcal</div>
+        </div>
+        <div className="stat-card stat-card-pink">
+          <div className="sc-icon">💪</div>
+          <div className="sc-label">Protein</div>
+          <div className="sc-val">{totalMacro('protein')}g</div>
+          <div className="sc-sub">/ {nutrition.protein}g</div>
+        </div>
+        <div className="stat-card stat-card-lime">
+          <div className="sc-icon">🌾</div>
+          <div className="sc-label">Carbs</div>
+          <div className="sc-val" style={{color:'#111'}}>{totalMacro('carbs')}g</div>
+          <div className="sc-sub" style={{color:'rgba(0,0,0,.5)'}}>/ {nutrition.carbs}g</div>
+        </div>
       </div>
       <div className="calorie-ring-wrap">
         <svg width="200" height="200" viewBox="0 0 200 200">
           <defs>
-            <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="0%">
-              <stop offset="0%" stopColor="#3DDC6B" />
-              <stop offset="100%" stopColor="#2ab854" />
+            <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stopColor="#C8FF57" />
+              <stop offset="50%" stopColor="#FF6B9D" />
+              <stop offset="100%" stopColor="#A855F7" />
             </linearGradient>
           </defs>
           {/* Track */}
@@ -1114,9 +1224,9 @@ function HomeTab({ foodLog, nutrition, totalCals, totalMacro, mealCals, waterCup
       </div>
       <div className="macro-bars">
         {[
-          { name:'Protein', val:totalMacro('protein'), goal:nutrition.protein, color:'#3DDC6B' },
-          { name:'Carbs',   val:totalMacro('carbs'),   goal:nutrition.carbs,   color:'#36B9FF' },
-          { name:'Fat',     val:totalMacro('fat'),      goal:nutrition.fat,     color:'#FF6B35' },
+          { name:'Protein', val:totalMacro('protein'), goal:nutrition.protein, color:'#FF6B9D' },
+          { name:'Carbs',   val:totalMacro('carbs'),   goal:nutrition.carbs,   color:'#C8FF57' },
+          { name:'Fat',     val:totalMacro('fat'),      goal:nutrition.fat,     color:'#A855F7' },
         ].map(m => (
           <div key={m.name} className="macro-bar-row">
             <div className="macro-bar-label">
@@ -1129,6 +1239,64 @@ function HomeTab({ foodLog, nutrition, totalCals, totalMacro, mealCals, waterCup
           </div>
         ))}
       </div>
+      {/* ── AI COACH CARD ── */}
+      <div style={{ padding: '0 20px', marginBottom: 20 }}>
+        <div style={{ background: 'linear-gradient(135deg, #1a3d28 0%, #0f2418 100%)', border: '1px solid var(--border-green)', borderRadius: 18, overflow: 'hidden' }}>
+          <div style={{ padding: '16px 18px 12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ width: 36, height: 36, background: 'var(--green-dim)', borderRadius: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18 }}>🤖</div>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 800, color: 'var(--text)' }}>AI Nutrition Coach</div>
+                <div style={{ fontSize: 11, color: 'var(--text-mid)' }}>Personalised for you today</div>
+              </div>
+            </div>
+            <button onClick={fetchSuggestions} style={{ background: 'var(--green-dim)', border: '1px solid var(--border-green)', borderRadius: 20, padding: '6px 12px', fontSize: 12, fontWeight: 700, color: 'var(--green)', cursor: 'pointer' }}>
+              {aiLoading ? '...' : '↻ Refresh'}
+            </button>
+          </div>
+          {aiSuggestions?.coachMsg && (
+            <div style={{ padding: '0 18px 12px', fontSize: 14, color: 'var(--text-mid)', fontStyle: 'italic', borderBottom: '1px solid rgba(255,255,255,.06)' }}>
+              "{aiSuggestions.coachMsg}"
+            </div>
+          )}
+          {aiSuggestions?.insight && (
+            <div style={{ margin: '10px 18px', background: 'rgba(255,255,255,.05)', borderRadius: 12, padding: '10px 14px', display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+              <span style={{ fontSize: 18, flexShrink: 0 }}>{aiSuggestions.insight.icon}</span>
+              <span style={{ fontSize: 13, color: 'var(--text-mid)', lineHeight: 1.5 }}>{aiSuggestions.insight.text}</span>
+            </div>
+          )}
+          {aiLoading && (
+            <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-mid)', fontSize: 13 }}>
+              <div style={{ fontSize: 24, marginBottom: 8, animation: 'pulse 1s infinite' }}>🧠</div>
+              Analysing your nutrition...
+            </div>
+          )}
+          {!aiLoading && aiSuggestions?.suggestions && (
+            <div style={{ padding: '4px 18px 18px' }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-light)', textTransform: 'uppercase', letterSpacing: '.5px', marginBottom: 10, marginTop: 8 }}>
+                Suggested for you now
+              </div>
+              {aiSuggestions.suggestions.map((s, i) => (
+                <div key={i} style={{ background: 'rgba(255,255,255,.04)', border: '1px solid rgba(255,255,255,.06)', borderRadius: 14, padding: '12px 14px', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <span style={{ fontSize: 28, flexShrink: 0 }}>{s.emoji}</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)', marginBottom: 2 }}>{s.name}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-mid)', marginBottom: 4 }}>💡 {s.reason}</div>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 11, background: 'rgba(61,220,107,.15)', color: 'var(--green)', borderRadius: 6, padding: '2px 8px', fontWeight: 700 }}>{s.cal} kcal</span>
+                      <span style={{ fontSize: 11, color: 'var(--text-light)' }}>🥩 {s.protein}g</span>
+                      <span style={{ fontSize: 11, color: 'var(--text-light)' }}>🍞 {s.carbs}g</span>
+                      <span style={{ fontSize: 11, color: 'var(--text-light)' }}>🧈 {s.fat}g</span>
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--green)', marginTop: 4 }}>✨ {s.tip}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
       {meals.map(meal => (
         <div key={meal} className="meal-section-card">
           <div className="meal-section-header">
@@ -1196,37 +1364,247 @@ function PlanTab({ nutrition, planDay, onDayChange }) {
 }
 
 // ── INSIGHTS TAB ──
-function InsightsTab({ nutrition, profile }) {
+function InsightsTab({ nutrition, profile, streak, weightLogs, onLogWeight }) {
+  const [weightInput, setWeightInput] = useState('');
+  const [weightUnit, setWeightUnit]   = useState(profile.weightUnit || 'lbs');
+  const [showWeightInput, setShowWeightInput] = useState(false);
+
+  const handleLogWeight = () => {
+    const w = parseFloat(weightInput);
+    if (!w || w < 20 || w > 500) return;
+    onLogWeight(w, weightUnit);
+    setWeightInput('');
+    setShowWeightInput(false);
+  };
+
+  // ── Weight Chart (SVG) ──
+  const chartW = 320, chartH = 140, padL = 40, padR = 16, padT = 16, padB = 28;
+  const innerW = chartW - padL - padR;
+  const innerH = chartH - padT - padB;
+
+  const hasData = weightLogs.length >= 2;
+  const vals    = weightLogs.map(l => parseFloat(l.weight));
+  const minW    = hasData ? Math.min(...vals) - 2 : 60;
+  const maxW    = hasData ? Math.max(...vals) + 2 : 180;
+
+  const toX = (i) => padL + (i / (weightLogs.length - 1)) * innerW;
+  const toY = (v) => padT + innerH - ((v - minW) / (maxW - minW)) * innerH;
+
+  const pathD = hasData
+    ? weightLogs.map((l, i) => `${i === 0 ? 'M' : 'L'} ${toX(i)} ${toY(parseFloat(l.weight))}`).join(' ')
+    : '';
+
+  const areaD = hasData
+    ? `${pathD} L ${toX(weightLogs.length-1)} ${padT+innerH} L ${toX(0)} ${padT+innerH} Z`
+    : '';
+
+  const targetWeight = profile.weightUnit === 'lbs' ? profile.targetWeightLbs : profile.targetWeightKg;
+  const targetY      = hasData ? toY(targetWeight) : null;
+
+  // ── Streak Badges ──
+  const BADGES = [
+    { days:1,   icon:'✅', label:'First Log',    color:'#3DDC6B' },
+    { days:3,   icon:'🔥', label:'3-Day Streak', color:'#FF6B35' },
+    { days:7,   icon:'💪', label:'1 Week',       color:'#36B9FF' },
+    { days:14,  icon:'⭐', label:'2 Weeks',      color:'#FFC107' },
+    { days:30,  icon:'🏆', label:'1 Month',      color:'#9C27B0' },
+    { days:100, icon:'👑', label:'100 Days',     color:'#FFD700' },
+  ];
+  const current = streak?.current_streak || 0;
+  const longest = streak?.longest_streak || 0;
+  const total   = streak?.total_days     || 0;
+
   return (
     <div className="tab-content">
-      <div className="main-header"><h1>Insights</h1></div>
-      <div style={{padding:'0 20px'}}>
-        <div className="summary-card" style={{marginBottom:16}}>
+      <div className="main-header">
+        <div><h1>Insights</h1><div className="date">Your progress overview</div></div>
+      </div>
+
+      {/* ── STREAK SECTION ── */}
+      <div style={{ padding:'0 20px', marginBottom:20 }}>
+        <div style={{ background:'linear-gradient(135deg,#1a3d28,#0f2418)', border:'1px solid var(--border-green)', borderRadius:18, padding:'18px 18px 14px' }}>
+          <div style={{ fontSize:12, fontWeight:700, color:'var(--text-light)', textTransform:'uppercase', letterSpacing:'.5px', marginBottom:14 }}>Streak & Badges</div>
+
+          {/* Streak stats */}
+          <div style={{ display:'flex', gap:10, marginBottom:16 }}>
+            {[
+              { icon:'🔥', val:current, label:'Current' },
+              { icon:'🏆', val:longest, label:'Best' },
+              { icon:'📅', val:total,   label:'Total Days' },
+            ].map((s,i) => (
+              <div key={i} style={{ flex:1, background:'rgba(255,255,255,.05)', borderRadius:14, padding:'12px 8px', textAlign:'center' }}>
+                <div style={{ fontSize:22 }}>{s.icon}</div>
+                <div style={{ fontSize:24, fontWeight:900, color:'var(--green)', lineHeight:1.1, marginTop:4 }}>{s.val}</div>
+                <div style={{ fontSize:11, color:'var(--text-mid)', marginTop:3 }}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Badge row */}
+          <div style={{ fontSize:12, fontWeight:700, color:'var(--text-light)', textTransform:'uppercase', letterSpacing:'.5px', marginBottom:10 }}>Badges</div>
+          <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+            {BADGES.map((b,i) => {
+              const unlocked = total >= b.days;
+              return (
+                <div key={i} style={{
+                  display:'flex', flexDirection:'column', alignItems:'center', gap:4,
+                  padding:'10px 12px', borderRadius:14, minWidth:60, textAlign:'center',
+                  background: unlocked ? `${b.color}22` : 'rgba(255,255,255,.04)',
+                  border:`1px solid ${unlocked ? b.color+'66' : 'rgba(255,255,255,.06)'}`,
+                  opacity: unlocked ? 1 : 0.4,
+                }}>
+                  <span style={{ fontSize:24, filter: unlocked ? 'none' : 'grayscale(1)' }}>{b.icon}</span>
+                  <span style={{ fontSize:10, fontWeight:700, color: unlocked ? b.color : 'var(--text-light)' }}>{b.label}</span>
+                  {!unlocked && (
+                    <span style={{ fontSize:9, color:'var(--text-light)' }}>{b.days - total}d left</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {current > 0 && (
+            <div style={{ marginTop:12, padding:'8px 12px', background:'rgba(61,220,107,.1)', borderRadius:10, fontSize:13, color:'var(--green)', textAlign:'center' }}>
+              🔥 {current}-day streak! Keep it going!
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── WEIGHT CHART ── */}
+      <div style={{ padding:'0 20px', marginBottom:20 }}>
+        <div style={{ background:'var(--bg-card)', border:'1px solid var(--border)', borderRadius:18, padding:'18px' }}>
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
+            <div>
+              <div style={{ fontSize:15, fontWeight:800, color:'var(--text)' }}>⚖️ Weight Progress</div>
+              <div style={{ fontSize:12, color:'var(--text-mid)', marginTop:2 }}>Last 30 days</div>
+            </div>
+            <button onClick={() => setShowWeightInput(s=>!s)} style={{
+              background:'var(--green-dim)', border:'1px solid var(--border-green)',
+              borderRadius:20, padding:'6px 14px', fontSize:12, fontWeight:700,
+              color:'var(--green)', cursor:'pointer',
+            }}>+ Log Weight</button>
+          </div>
+
+          {/* Weight input */}
+          {showWeightInput && (
+            <div style={{ display:'flex', gap:8, marginBottom:14, alignItems:'center' }}>
+              <div className="unit-toggle" style={{ margin:0, flexShrink:0 }}>
+                <button className={`unit-btn ${weightUnit==='lbs'?'active':''}`} onClick={() => setWeightUnit('lbs')}>lbs</button>
+                <button className={`unit-btn ${weightUnit==='kg'?'active':''}`} onClick={() => setWeightUnit('kg')}>kg</button>
+              </div>
+              <input type="number" placeholder={`e.g. ${weightUnit==='lbs'?'165':'75'}`}
+                value={weightInput} onChange={e => setWeightInput(e.target.value)}
+                style={{ flex:1, padding:'10px 14px', borderRadius:12, border:'1px solid var(--border-green)', background:'var(--bg-input)', color:'var(--text)', fontSize:16, fontWeight:700, outline:'none' }}
+              />
+              <button onClick={handleLogWeight} style={{
+                background:'var(--green)', border:'none', borderRadius:12,
+                padding:'10px 16px', color:'#0B1612', fontWeight:700, fontSize:14, cursor:'pointer',
+              }}>Save</button>
+            </div>
+          )}
+
+          {/* SVG Chart */}
+          {hasData ? (
+            <svg width="100%" viewBox={`0 0 ${chartW} ${chartH}`} style={{ overflow:'visible' }}>
+              <defs>
+                <linearGradient id="wGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#3DDC6B" stopOpacity="0.3"/>
+                  <stop offset="100%" stopColor="#3DDC6B" stopOpacity="0"/>
+                </linearGradient>
+              </defs>
+
+              {/* Grid lines */}
+              {[0,.25,.5,.75,1].map((t,i) => {
+                const y = padT + innerH * t;
+                const val = maxW - (maxW - minW) * t;
+                return (
+                  <g key={i}>
+                    <line x1={padL} y1={y} x2={chartW-padR} y2={y} stroke="rgba(255,255,255,.06)" strokeWidth="1"/>
+                    <text x={padL-6} y={y+4} fontSize="9" fill="var(--text-light)" textAnchor="end">{Math.round(val)}</text>
+                  </g>
+                );
+              })}
+
+              {/* Target weight line */}
+              {targetY && targetY >= padT && targetY <= padT+innerH && (
+                <g>
+                  <line x1={padL} y1={targetY} x2={chartW-padR} y2={targetY} stroke="#FF6B35" strokeWidth="1.5" strokeDasharray="4 4"/>
+                  <text x={chartW-padR+4} y={targetY+4} fontSize="9" fill="#FF6B35">Goal</text>
+                </g>
+              )}
+
+              {/* Area fill */}
+              <path d={areaD} fill="url(#wGrad)"/>
+
+              {/* Line */}
+              <path d={pathD} fill="none" stroke="var(--green)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
+
+              {/* Data points */}
+              {weightLogs.map((l,i) => (
+                <circle key={i} cx={toX(i)} cy={toY(parseFloat(l.weight))} r="4"
+                  fill="var(--bg-card)" stroke="var(--green)" strokeWidth="2.5"/>
+              ))}
+
+              {/* Latest value label */}
+              {weightLogs.length > 0 && (
+                <text x={toX(weightLogs.length-1)} y={toY(parseFloat(weightLogs[weightLogs.length-1].weight))-10}
+                  fontSize="11" fontWeight="700" fill="var(--green)" textAnchor="middle">
+                  {weightLogs[weightLogs.length-1].weight} {weightUnit}
+                </text>
+              )}
+
+              {/* X axis dates */}
+              {weightLogs.length > 0 && [0, Math.floor((weightLogs.length-1)/2), weightLogs.length-1]
+                .filter((v,i,a) => a.indexOf(v) === i)
+                .map((idx) => (
+                  <text key={idx} x={toX(idx)} y={chartH-4} fontSize="9" fill="var(--text-light)" textAnchor="middle">
+                    {weightLogs[idx].log_date.slice(5)}
+                  </text>
+                ))
+              }
+            </svg>
+          ) : (
+            <div style={{ textAlign:'center', padding:'30px 20px', color:'var(--text-mid)' }}>
+              <div style={{ fontSize:36, marginBottom:8 }}>⚖️</div>
+              <div style={{ fontSize:14, fontWeight:700, color:'var(--text)', marginBottom:4 }}>No weight data yet</div>
+              <div style={{ fontSize:13 }}>Tap "+ Log Weight" above to start tracking your progress</div>
+            </div>
+          )}
+
+          {/* Start / target weight */}
+          {hasData && (
+            <div style={{ display:'flex', gap:10, marginTop:12 }}>
+              {[
+                { label:'Starting', val:`${weightLogs[0].weight} ${weightUnit}`, color:'var(--text-mid)' },
+                { label:'Current',  val:`${weightLogs[weightLogs.length-1].weight} ${weightUnit}`, color:'var(--green)' },
+                { label:'Target',   val:`${targetWeight} ${weightUnit}`, color:'#FF6B35' },
+              ].map((s,i) => (
+                <div key={i} style={{ flex:1, background:'var(--bg-card2)', borderRadius:10, padding:'8px', textAlign:'center' }}>
+                  <div style={{ fontSize:11, color:'var(--text-light)', marginBottom:3 }}>{s.label}</div>
+                  <div style={{ fontSize:13, fontWeight:800, color:s.color }}>{s.val}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── WEEKLY STATS ── */}
+      <div style={{ padding:'0 20px', marginBottom:20 }}>
+        <div className="summary-card">
           <h3>This Week</h3>
           {[
             { icon:'🔥', label:'Avg daily calories', val:`${Math.round(nutrition.calorieTarget*0.88).toLocaleString()} kcal` },
-            { icon:'💪', label:'Avg protein intake',  val:`${nutrition.protein}g / day` },
-            { icon:'🎯', label:'Goal adherence',       val:'88%' },
-            { icon:'💧', label:'Avg water intake',     val:'6 cups / day' },
-          ].map((r,i) => (
-            <div key={i} className="summary-row" style={i===3?{marginBottom:0}:{}}>
+            { icon:'💪', label:'Avg protein intake', val:`${nutrition.protein}g / day` },
+            { icon:'🎯', label:'Goal adherence',      val:'88%' },
+            { icon:'💧', label:'Avg water intake',    val:'6 cups / day' },
+          ].map((r,i,a) => (
+            <div key={i} className="summary-row" style={i===a.length-1?{marginBottom:0}:{}}>
               <span className="s-icon">{r.icon}</span>
               <div><div className="s-label">{r.label}</div><div className="s-val">{r.val}</div></div>
             </div>
           ))}
-        </div>
-        <div className="summary-card">
-          <h3>Progress</h3>
-          <div className="summary-row">
-            <span className="s-icon">📉</span>
-            <div><div className="s-label">Weight trend</div>
-              <div className="s-val">{profile.goal==='lose'?'↓ On track to lose 1 lb/week':profile.goal==='gain'?'↑ On track to gain 0.5 lb/week':'→ Maintaining'}</div>
-            </div>
-          </div>
-          <div className="summary-row" style={{marginBottom:0}}>
-            <span className="s-icon">🏆</span>
-            <div><div className="s-label">Streak</div><div className="s-val">3 days 🔥</div></div>
-          </div>
         </div>
       </div>
     </div>
@@ -1234,7 +1612,7 @@ function InsightsTab({ nutrition, profile }) {
 }
 
 // ── PROFILE TAB ──
-function ProfileTab({ user, profile, nutrition, goalObj, actObj, onSignOut, showToast }) {
+function ProfileTab({ user, profile, nutrition, goalObj, actObj, onSignOut, showToast, onEditProfile, streak }) {
   const weightDisp = profile.weightUnit==='lbs' ? `${profile.weightLbs} lbs` : `${profile.weightKg} kg`;
   const heightDisp = profile.heightUnit==='ft'  ? `${profile.heightFt}'${profile.heightIn}"` : `${profile.heightCm} cm`;
   return (
@@ -1243,6 +1621,11 @@ function ProfileTab({ user, profile, nutrition, goalObj, actObj, onSignOut, show
         <div className="profile-avatar">👤</div>
         <div className="profile-name">{user?.name || 'Your Profile'}</div>
         <div className="profile-goal">{goalObj.icon} {goalObj.name}</div>
+        {streak?.current_streak > 0 && (
+          <div style={{ display:'inline-flex', alignItems:'center', gap:6, background:'rgba(255,107,53,.2)', border:'1px solid rgba(255,107,53,.4)', borderRadius:20, padding:'5px 14px', marginTop:10, fontSize:13, fontWeight:700, color:'#FF9060' }}>
+            🔥 {streak.current_streak}-day streak
+          </div>
+        )}
       </div>
       <div className="profile-stats-row">
         <div className="profile-stat"><div className="ps-val">{nutrition.bmi}</div><div className="ps-label">BMI</div></div>
@@ -1267,7 +1650,7 @@ function ProfileTab({ user, profile, nutrition, goalObj, actObj, onSignOut, show
         <h3>My Details</h3>
         <div className="settings-item"><div className="si-left"><span className="si-icon">🎂</span><span className="si-name">Age</span></div><span className="si-val">{profile.age} years</span></div>
         <div className="settings-item"><div className="si-left"><span className="si-icon">⚡</span><span className="si-name">Activity Level</span></div><span className="si-val">{actObj.name}</span></div>
-        <div className="settings-item" onClick={() => showToast('Edit profile coming soon!')}><div className="si-left"><span className="si-icon">✏️</span><span className="si-name">Edit Profile</span></div><span className="si-arrow">›</span></div>
+        <div className="settings-item" onClick={onEditProfile}><div className="si-left"><span className="si-icon">✏️</span><span className="si-name">Edit Profile</span></div><span className="si-arrow">›</span></div>
       </div>
       <div className="settings-section">
         <h3>App</h3>
@@ -1324,12 +1707,15 @@ function FoodModal({ meal, onClose, onAdd }) {
 }
 
 // ════════════════════════════════════════════════
-// SCANNER — powered by Google Cloud Vision
+// SCANNER — Photo (Google Vision) + Barcode (Open Food Facts)
 // ════════════════════════════════════════════════
 function ScannerScreen({ onBack, onLog, showToast, userId }) {
   const videoRef    = useRef(null);
   const canvasRef   = useRef(null);
   const streamRef   = useRef(null);
+  const detectorRef = useRef(null);
+  const scanLoopRef = useRef(null);
+  const [scanTab, setScanTab]           = useState('photo'); // 'photo' | 'barcode'
   const [results, setResults]           = useState([]);
   const [selected, setSelected]         = useState(null);
   const [status, setStatus]             = useState('idle');
@@ -1338,6 +1724,8 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
   const [capturedDataUrl, setCapturedDataUrl] = useState(null);
   const [logMeal, setLogMeal]           = useState('lunch');
   const [scansRemaining, setScansRemaining] = useState(null);
+  const [barcodeStatus, setBarcodeStatus] = useState('scanning'); // 'scanning'|'found'|'notfound'
+  const [barcodeResult, setBarcodeResult] = useState(null);
 
   // Start camera
   useEffect(() => {
@@ -1352,7 +1740,6 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
           videoRef.current.srcObject = stream;
           videoRef.current.onloadedmetadata = () => {
             videoRef.current.play();
-            // Give the video a moment to render first frame
             setTimeout(() => setCameraReady(true), 500);
           };
         }
@@ -1362,8 +1749,90 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
       }
     };
     start();
-    return () => { streamRef.current?.getTracks().forEach(t => t.stop()); };
+    return () => {
+      streamRef.current?.getTracks().forEach(t => t.stop());
+      if (scanLoopRef.current) cancelAnimationFrame(scanLoopRef.current);
+    };
   }, []);
+
+  // ── Switch tab: start/stop barcode loop ──
+  useEffect(() => {
+    if (scanLoopRef.current) cancelAnimationFrame(scanLoopRef.current);
+    if (scanTab === 'barcode' && cameraReady) {
+      setBarcodeStatus('scanning');
+      setBarcodeResult(null);
+      startBarcodeLoop();
+    }
+  }, [scanTab, cameraReady]);
+
+  // ── Barcode detection loop using BarcodeDetector API ──
+  const startBarcodeLoop = () => {
+    if (!('BarcodeDetector' in window)) {
+      setBarcodeStatus('unsupported');
+      return;
+    }
+    if (!detectorRef.current) {
+      detectorRef.current = new window.BarcodeDetector({
+        formats: ['ean_13','ean_8','upc_a','upc_e','code_128','code_39','qr_code'],
+      });
+    }
+    const detect = async () => {
+      if (scanTab !== 'barcode') return;
+      try {
+        if (videoRef.current && videoRef.current.readyState === 4) {
+          const barcodes = await detectorRef.current.detect(videoRef.current);
+          if (barcodes.length > 0) {
+            const code = barcodes[0].rawValue;
+            console.log('[Barcode] Detected:', code);
+            setBarcodeStatus('found');
+            lookupBarcode(code);
+            return; // stop loop after detection
+          }
+        }
+      } catch (e) { /* continue */ }
+      scanLoopRef.current = requestAnimationFrame(detect);
+    };
+    scanLoopRef.current = requestAnimationFrame(detect);
+  };
+
+  // ── Look up barcode on Open Food Facts ──
+  const lookupBarcode = async (code) => {
+    setBarcodeStatus('loading');
+    try {
+      const res  = await fetch(`/api/barcode?code=${code}`);
+      const data = await res.json();
+      if (data.found) {
+        setBarcodeResult(data);
+        setBarcodeStatus('found');
+      } else {
+        setBarcodeStatus('notfound');
+        showToast('❌ Product not found. Try searching manually.');
+      }
+    } catch (e) {
+      setBarcodeStatus('notfound');
+      showToast('❌ Barcode lookup failed.');
+    }
+  };
+
+  const resetBarcode = () => {
+    setBarcodeResult(null);
+    setBarcodeStatus('scanning');
+    startBarcodeLoop();
+  };
+
+  const handleBarcodeLog = () => {
+    if (!barcodeResult) return;
+    onLog({ ...barcodeResult, meal: logMeal });
+  };
+
+  // ── Tab switch helper ──
+  const switchScanTab = (tab) => {
+    setScanTab(tab);
+    setStatus('idle');
+    setResults([]);
+    setSelected(null);
+    setCapturedDataUrl(null);
+  };
 
   // Step 1: Capture frame from video → show preview → then send to API
   const captureAndScan = async () => {
@@ -1459,25 +1928,40 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
     <div className="screen scanner-screen">
       <canvas ref={canvasRef} style={{ display: 'none' }} />
 
+      {/* Header */}
       <div className="scanner-header">
         <button className="btn-back" style={{ color: '#fff' }} onClick={onBack}>‹</button>
         <h2>Food Scanner</h2>
         <div style={{ marginLeft: 'auto', textAlign: 'right' }}>
-          <div style={{ fontSize: 11, color: 'rgba(255,255,255,.55)' }}>Google Vision AI</div>
-          {scansRemaining !== null && (
-            <div style={{
-              fontSize: 11, fontWeight: 700,
-              color: scansRemaining <= 2 ? '#FF6B35' : 'rgba(255,255,255,.7)',
-            }}>
+          <div style={{ fontSize: 11, color: 'rgba(255,255,255,.55)' }}>
+            {scanTab === 'photo' ? 'Google Vision AI' : 'Open Food Facts'}
+          </div>
+          {scanTab === 'photo' && scansRemaining !== null && (
+            <div style={{ fontSize: 11, fontWeight: 700, color: scansRemaining <= 2 ? '#FF6B35' : 'rgba(255,255,255,.7)' }}>
               {scansRemaining} scan{scansRemaining !== 1 ? 's' : ''} left today
             </div>
           )}
         </div>
       </div>
 
+      {/* Mode tabs */}
+      <div style={{ display:'flex', gap:8, padding:'10px 16px', background:'rgba(0,0,0,.5)', backdropFilter:'blur(10px)' }}>
+        {[['photo','📸 Photo','AI Vision'],['barcode','🔲 Barcode','Instant scan']].map(([id,label,sub]) => (
+          <button key={id} onClick={() => switchScanTab(id)} style={{
+            flex:1, padding:'10px 8px', borderRadius:14, border:'1.5px solid',
+            borderColor: scanTab===id ? 'var(--green)' : 'rgba(255,255,255,.1)',
+            background: scanTab===id ? 'rgba(61,220,107,.15)' : 'rgba(255,255,255,.05)',
+            cursor:'pointer', textAlign:'center',
+          }}>
+            <div style={{ fontSize:14, fontWeight:700, color: scanTab===id ? 'var(--green)' : '#fff' }}>{label}</div>
+            <div style={{ fontSize:11, color:'rgba(255,255,255,.5)', marginTop:2 }}>{sub}</div>
+          </button>
+        ))}
+      </div>
+
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
 
-        {/* Live camera feed (always mounted so stream stays alive) */}
+        {/* Live camera feed — always mounted so stream stays alive */}
         <video
           ref={videoRef}
           style={{ width: '100%', height: '100%', objectFit: 'cover', display: cameraError ? 'none' : 'block' }}
@@ -1493,8 +1977,9 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
           />
         )}
 
+        {/* ── PHOTO TAB OVERLAYS ── */}
         {/* No camera */}
-        {cameraError && !isDone && (
+        {scanTab === 'photo' && cameraError && !isDone && (
           <div className="no-camera">
             <div style={{ fontSize: 60 }}>📷</div>
             <p style={{ fontSize: 16, fontWeight: 700 }}>Camera not available</p>
@@ -1509,7 +1994,7 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
         )}
 
         {/* Idle overlay */}
-        {!cameraError && status === 'idle' && (
+        {scanTab === 'photo' && !cameraError && status === 'idle' && (
           <div className="scanner-overlay">
             <div className="scan-frame">{cameraReady && <div className="scan-line" />}</div>
             <p className="scan-hint">
@@ -1529,7 +2014,7 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
         )}
 
         {/* Capturing flash */}
-        {status === 'capturing' && (
+        {scanTab === 'photo' && status === 'capturing' && (
           <div className="scanner-overlay" style={{ background: 'rgba(255,255,255,.15)' }}>
             <div style={{ textAlign: 'center', color: '#fff' }}>
               <div style={{ fontSize: 52 }}>📸</div>
@@ -1539,7 +2024,7 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
         )}
 
         {/* Analysing overlay */}
-        {status === 'scanning' && (
+        {scanTab === 'photo' && status === 'scanning' && (
           <div className="scanner-overlay" style={{ background: 'rgba(0,0,0,.65)' }}>
             <div style={{ textAlign: 'center', color: '#fff' }}>
               <div style={{ fontSize: 48, marginBottom: 14, animation: 'pulse 1s ease-in-out infinite' }}>🔍</div>
@@ -1555,7 +2040,7 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
         )}
 
         {/* Error state */}
-        {status === 'error' && (
+        {scanTab === 'photo' && status === 'error' && (
           <div className="scanner-overlay" style={{ background: 'rgba(0,0,0,.7)' }}>
             <div style={{ textAlign: 'center', color: '#fff', padding: '0 30px' }}>
               <div style={{ fontSize: 48, marginBottom: 12 }}>⚠️</div>
@@ -1572,8 +2057,8 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
           </div>
         )}
 
-        {/* Results */}
-        {isDone && results.length > 0 && (
+        {/* Photo Results */}
+        {scanTab === 'photo' && isDone && results.length > 0 && (
           <div className="scanner-result-card" style={{ maxHeight: '75vh', overflowY: 'auto' }}>
 
             {status === 'done-test' && (
@@ -1598,10 +2083,10 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
             <div style={{ fontSize:13, color:'var(--text-light)', marginBottom:16 }}>{selected?.serving} · Google Vision AI</div>
 
             <div className="scanner-macros" style={{ marginBottom:16 }}>
-              <div className="scanner-macro"><div className="sm-val" style={{color:'var(--green)'}}>{selected?.cal}</div><div className="sm-label">Cal</div></div>
-              <div className="scanner-macro"><div className="sm-val" style={{color:'var(--green)'}}>{selected?.protein}g</div><div className="sm-label">Protein</div></div>
-              <div className="scanner-macro"><div className="sm-val" style={{color:'var(--green)'}}>{selected?.carbs}g</div><div className="sm-label">Carbs</div></div>
-              <div className="scanner-macro"><div className="sm-val" style={{color:'var(--green)'}}>{selected?.fat}g</div><div className="sm-label">Fat</div></div>
+              <div className="scanner-macro"><div className="sm-val" style={{color:'var(--orange)'}}>{selected?.cal}</div><div className="sm-label">Cal</div></div>
+              <div className="scanner-macro"><div className="sm-val" style={{color:'var(--pink)'}}>{selected?.protein}g</div><div className="sm-label">Protein</div></div>
+              <div className="scanner-macro"><div className="sm-val" style={{color:'var(--lime)'}}>{selected?.carbs}g</div><div className="sm-label">Carbs</div></div>
+              <div className="scanner-macro"><div className="sm-val" style={{color:'var(--purple)'}}>{selected?.fat}g</div><div className="sm-label">Fat</div></div>
             </div>
 
             {results.length > 1 && (
@@ -1653,12 +2138,224 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
           </div>
         )}
 
+        {/* ── BARCODE TAB ── */}
+        {scanTab === 'barcode' && !barcodeResult && (
+          <div className="scanner-overlay">
+            {/* Barcode frame — wider, shorter */}
+            <div style={{
+              width: 300, height: 140, borderRadius: 16,
+              border: '2px solid var(--green)',
+              boxShadow: '0 0 0 9999px rgba(0,0,0,.5), 0 0 30px rgba(61,220,107,.3)',
+              position: 'relative',
+            }}>
+              {/* Animated scan line */}
+              <div style={{
+                position:'absolute', left:6, right:6, height:2,
+                background:'linear-gradient(90deg,transparent,var(--green),transparent)',
+                animation:'scanMove 1.5s ease-in-out infinite',
+                boxShadow:'0 0 8px var(--green)',
+              }} />
+              {/* Corner marks */}
+              {[[0,0],[1,0],[0,1],[1,1]].map(([r,b],i) => (
+                <div key={i} style={{
+                  position:'absolute', width:20, height:20,
+                  top: r ? 'auto' : -2, bottom: r ? -2 : 'auto',
+                  left: b ? 'auto' : -2, right: b ? -2 : 'auto',
+                  borderTop: r ? 'none' : '3px solid var(--green)',
+                  borderBottom: r ? '3px solid var(--green)' : 'none',
+                  borderLeft: b ? 'none' : '3px solid var(--green)',
+                  borderRight: b ? '3px solid var(--green)' : 'none',
+                  borderRadius: r===0&&b===0?'4px 0 0 0':r===0&&b===1?'0 4px 0 0':r===1&&b===0?'0 0 0 4px':'0 0 4px 0',
+                }}/>
+              ))}
+            </div>
+            <p style={{ color:'rgba(255,255,255,.8)', fontSize:14, textAlign:'center', marginTop:12 }}>
+              {barcodeStatus === 'loading' ? '🔍 Looking up product...' :
+               barcodeStatus === 'unsupported' ? '⚠️ Barcode detection not supported on this browser' :
+               'Point at a product barcode'}
+            </p>
+            {barcodeStatus === 'unsupported' && (
+              <p style={{ color:'rgba(255,255,255,.5)', fontSize:12, textAlign:'center', padding:'0 40px', marginTop:6 }}>
+                Try Chrome on Android for best results
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Barcode result card */}
+        {scanTab === 'barcode' && barcodeResult && (
+          <div className="scanner-result-card" style={{ maxHeight:'75vh', overflowY:'auto' }}>
+            <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:12 }}>
+              {barcodeResult.image && (
+                <img src={barcodeResult.image} alt={barcodeResult.name}
+                  style={{ width:60, height:60, objectFit:'contain', borderRadius:10, background:'#fff', padding:4 }} />
+              )}
+              <div style={{ flex:1 }}>
+                <h3 style={{ fontSize:17, marginBottom:2 }}>{barcodeResult.name}</h3>
+                <div style={{ fontSize:13, color:'var(--text-light)' }}>
+                  {barcodeResult.brand} · {barcodeResult.serving}
+                </div>
+              </div>
+              <div style={{ background:'var(--green-dim)', border:'1px solid var(--border-green)', borderRadius:20, padding:'4px 10px' }}>
+                <div style={{ fontSize:11, color:'var(--green)', fontWeight:700 }}>🔲 Scanned</div>
+              </div>
+            </div>
+
+            <div className="scanner-macros" style={{ marginBottom:16 }}>
+              <div className="scanner-macro"><div className="sm-val" style={{color:'var(--orange)'}}>{barcodeResult.cal}</div><div className="sm-label">Cal</div></div>
+              <div className="scanner-macro"><div className="sm-val" style={{color:'var(--pink)'}}>{barcodeResult.protein}g</div><div className="sm-label">Protein</div></div>
+              <div className="scanner-macro"><div className="sm-val" style={{color:'var(--lime)'}}>{barcodeResult.carbs}g</div><div className="sm-label">Carbs</div></div>
+              <div className="scanner-macro"><div className="sm-val" style={{color:'var(--purple)'}}>{barcodeResult.fat}g</div><div className="sm-label">Fat</div></div>
+            </div>
+
+            <div style={{ marginBottom:14 }}>
+              <div style={{ fontSize:11, fontWeight:700, color:'var(--text-light)', marginBottom:8, textTransform:'uppercase', letterSpacing:'.5px' }}>Log to meal</div>
+              <div style={{ display:'flex', gap:8 }}>
+                {['breakfast','lunch','dinner','snacks'].map(m => (
+                  <button key={m} onClick={() => setLogMeal(m)} style={{
+                    flex:1, padding:'8px 4px', borderRadius:10, fontSize:12, fontWeight:700,
+                    border:'1.5px solid', textTransform:'capitalize', cursor:'pointer',
+                    borderColor: logMeal===m ? 'var(--green)' : 'var(--border)',
+                    background: logMeal===m ? 'var(--green-dim)' : 'var(--bg-card)',
+                    color: logMeal===m ? 'var(--green)' : 'var(--text-light)',
+                  }}>{m}</button>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ display:'flex', gap:10 }}>
+              <button className="btn-primary" style={{ flex:1 }} onClick={handleBarcodeLog}>
+                ✅ Log {barcodeResult.name}
+              </button>
+              <button onClick={resetBarcode} style={{
+                padding:'17px 16px', border:'1.5px solid var(--border)',
+                borderRadius:14, background:'var(--bg-card)', cursor:'pointer', fontSize:18,
+              }}>🔄</button>
+            </div>
+          </div>
+        )}
+
       </div>
     </div>
   );
 }
 
 // ════════════════════════════════════════════════
+// ════════════════════════════════════════════════
+// EDIT PROFILE MODAL
+// ════════════════════════════════════════════════
+function EditProfileModal({ profile, nutrition, onClose, onSave }) {
+  const [local, setLocal] = useState({ ...profile });
+  const upd = (k, v) => setLocal(p => ({ ...p, [k]: v }));
+
+  // Live preview of new calorie target
+  const preview = calcNutrition(local);
+
+  const fields = [
+    { label: 'Current Weight', type: 'weight',   key: 'weightLbs',   keyKg: 'weightKg',   unitKey: 'weightUnit' },
+    { label: 'Target Weight',  type: 'weight',   key: 'targetWeightLbs', keyKg: 'targetWeightKg', unitKey: 'targetWeightUnit' },
+    { label: 'Age',            type: 'number',   key: 'age',          min: 8,  max: 90 },
+  ];
+
+  return (
+    <div className="auth-modal-overlay" onClick={e => e.target===e.currentTarget && onClose()}>
+      <div className="auth-modal-sheet">
+        <div className="auth-modal-handle" />
+        <div className="auth-modal-scroll">
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:4 }}>
+            <div className="auth-title">Edit Profile</div>
+            <button onClick={onClose} style={{ background:'var(--bg-card2)', border:'1px solid var(--border)', borderRadius:8, width:30, height:30, color:'var(--text-light)', cursor:'pointer', fontSize:14 }}>✕</button>
+          </div>
+          <div className="auth-sub" style={{ marginBottom:16 }}>Changes instantly recalculate your calorie target</div>
+
+          {/* Goal */}
+          <div className="input-group">
+            <label className="input-label">Main Goal</label>
+            <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+              {GOALS.map(g => (
+                <button key={g.id} onClick={() => upd('goal', g.id)} style={{
+                  padding:'8px 14px', borderRadius:20, fontSize:13, fontWeight:700, cursor:'pointer',
+                  border:'1.5px solid', borderColor: local.goal===g.id ? 'var(--green)' : 'var(--border)',
+                  background: local.goal===g.id ? 'var(--green-dim)' : 'var(--bg-card2)',
+                  color: local.goal===g.id ? 'var(--green)' : 'var(--text-mid)',
+                }}>{g.icon} {g.name}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Activity Level */}
+          <div className="input-group">
+            <label className="input-label">Activity Level</label>
+            <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+              {ACTIVITIES.map(a => (
+                <div key={a.id} onClick={() => upd('activityLevel', a.id)} style={{
+                  padding:'12px 14px', borderRadius:12, cursor:'pointer', display:'flex', alignItems:'center', gap:10,
+                  border:'1.5px solid', borderColor: local.activityLevel===a.id ? 'var(--green)' : 'var(--border)',
+                  background: local.activityLevel===a.id ? 'var(--green-dim)' : 'var(--bg-card2)',
+                }}>
+                  <span style={{fontSize:20}}>{a.icon}</span>
+                  <div>
+                    <div style={{fontSize:14,fontWeight:700,color:'var(--text)'}}>{a.name}</div>
+                    <div style={{fontSize:12,color:'var(--text-mid)'}}>{a.desc}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Weight */}
+          <div className="input-group">
+            <label className="input-label">Current Weight</label>
+            <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+              <div className="unit-toggle" style={{ margin:0 }}>
+                <button className={`unit-btn ${local.weightUnit==='lbs'?'active':''}`} onClick={() => upd('weightUnit','lbs')}>lbs</button>
+                <button className={`unit-btn ${local.weightUnit==='kg'?'active':''}`} onClick={() => upd('weightUnit','kg')}>kg</button>
+              </div>
+              <input type="number" value={local.weightUnit==='lbs'?local.weightLbs:local.weightKg}
+                onChange={e => {
+                  const v = parseInt(e.target.value)||0;
+                  local.weightUnit==='lbs' ? upd('weightLbs',v) : upd('weightKg',v);
+                }}
+                style={{ flex:1, padding:'12px 14px', borderRadius:12, border:'1px solid var(--border)', background:'var(--bg-input)', color:'var(--text)', fontSize:16, fontWeight:700, outline:'none' }}
+              />
+            </div>
+          </div>
+
+          {/* Age */}
+          <div className="input-group">
+            <label className="input-label">Age</label>
+            <input type="number" value={local.age} min={8} max={90}
+              onChange={e => upd('age', parseInt(e.target.value)||25)}
+              style={{ padding:'12px 14px', borderRadius:12, border:'1px solid var(--border)', background:'var(--bg-input)', color:'var(--text)', fontSize:16, fontWeight:700, outline:'none', width:'100%' }}
+            />
+          </div>
+
+          {/* Live preview */}
+          <div style={{ background:'linear-gradient(135deg,#1a3d28,#0f2418)', border:'1px solid var(--border-green)', borderRadius:16, padding:'16px 18px' }}>
+            <div style={{ fontSize:12, color:'var(--text-mid)', marginBottom:6, textTransform:'uppercase', letterSpacing:'.5px' }}>New Calorie Target Preview</div>
+            <div style={{ fontSize:36, fontWeight:900, color:'var(--green)', letterSpacing:-1 }}>{preview.calorieTarget.toLocaleString()}</div>
+            <div style={{ fontSize:13, color:'var(--text-mid)', marginTop:4 }}>kcal / day</div>
+            <div style={{ display:'flex', gap:8, marginTop:10, flexWrap:'wrap' }}>
+              {[['🥩',preview.protein,'g protein'],['🍞',preview.carbs,'g carbs'],['🧈',preview.fat,'g fat']].map(([icon,val,label],i) => (
+                <span key={i} style={{ background:'rgba(255,255,255,.07)', borderRadius:16, padding:'4px 12px', fontSize:12, fontWeight:700, color:'var(--text)' }}>{icon} {val}{label}</span>
+              ))}
+            </div>
+            {preview.calorieTarget !== nutrition?.calorieTarget && (
+              <div style={{ fontSize:12, color:'var(--green)', marginTop:8 }}>
+                {preview.calorieTarget > nutrition?.calorieTarget ? '↑' : '↓'} {Math.abs(preview.calorieTarget - nutrition?.calorieTarget)} kcal change from current
+              </div>
+            )}
+          </div>
+
+          <button className="btn-primary" onClick={() => onSave(local)}>
+            Save & Recalculate ✓
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // HELPERS
 // ════════════════════════════════════════════════
 function getBmiHint(profile) {
