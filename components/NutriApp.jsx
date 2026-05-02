@@ -1727,25 +1727,66 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
   const [barcodeStatus, setBarcodeStatus] = useState('scanning'); // 'scanning'|'found'|'notfound'
   const [barcodeResult, setBarcodeResult] = useState(null);
 
-  // Start camera
+  // Start camera — iOS Safari compatible
   useEffect(() => {
     const start = async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
-          audio: false,
-        });
-        streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.onloadedmetadata = () => {
-            videoRef.current.play();
-            setTimeout(() => setCameraReady(true), 500);
-          };
-        }
-      } catch (e) {
-        console.warn('Camera error:', e);
+      // Check if getUserMedia is supported
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        console.warn('[Camera] getUserMedia not supported');
         setCameraError(true);
+        return;
+      }
+
+      // iOS Safari needs simple constraints first
+      const constraints = [
+        // Try 1: Back camera with ideal constraints (most devices)
+        { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false },
+        // Try 2: Back camera simple (iOS fallback)
+        { video: { facingMode: 'environment' }, audio: false },
+        // Try 3: Any camera (last resort)
+        { video: true, audio: false },
+      ];
+
+      let stream = null;
+      for (const constraint of constraints) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraint);
+          console.log('[Camera] Started with constraint:', JSON.stringify(constraint.video));
+          break;
+        } catch (e) {
+          console.warn('[Camera] Constraint failed:', e.name, e.message);
+        }
+      }
+
+      if (!stream) {
+        console.warn('[Camera] All constraints failed');
+        setCameraError(true);
+        return;
+      }
+
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        // iOS Safari requires these attributes
+        videoRef.current.setAttribute('autoplay', '');
+        videoRef.current.setAttribute('playsinline', '');
+        videoRef.current.setAttribute('muted', '');
+        videoRef.current.onloadedmetadata = () => {
+          videoRef.current.play().then(() => {
+            setTimeout(() => setCameraReady(true), 600);
+          }).catch(e => {
+            console.warn('[Camera] Play failed:', e);
+            // Try playing without waiting
+            setCameraReady(true);
+          });
+        };
+        // iOS fallback if onloadedmetadata doesn't fire
+        setTimeout(() => {
+          if (!cameraReady && stream.active) {
+            videoRef.current?.play().catch(() => {});
+            setCameraReady(true);
+          }
+        }, 3000);
       }
     };
     start();
@@ -1966,6 +2007,7 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
           ref={videoRef}
           style={{ width: '100%', height: '100%', objectFit: 'cover', display: cameraError ? 'none' : 'block' }}
           autoPlay playsInline muted
+          webkit-playsinline="true"
         />
 
         {/* Captured frame preview (shown briefly before API call) */}
@@ -1981,14 +2023,27 @@ function ScannerScreen({ onBack, onLog, showToast, userId }) {
         {/* No camera */}
         {scanTab === 'photo' && cameraError && !isDone && (
           <div className="no-camera">
-            <div style={{ fontSize: 60 }}>📷</div>
-            <p style={{ fontSize: 16, fontWeight: 700 }}>Camera not available</p>
-            <p style={{ fontSize: 14, opacity: .7, marginBottom: 12 }}>
-              You can still test Google Vision AI with a sample food image.
-            </p>
-            <button className="btn-primary" style={{ maxWidth: 240 }}
+            <div style={{ fontSize: 52 }}>📷</div>
+            <p style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Camera access needed</p>
+
+            {/* iOS specific instructions */}
+            <div style={{ background:'rgba(255,255,255,.06)', borderRadius:14, padding:'12px 16px', marginBottom:14, textAlign:'left', maxWidth:300 }}>
+              <p style={{ fontSize:13, fontWeight:700, color:'var(--lime)', marginBottom:8 }}>📱 iPhone — Allow camera:</p>
+              <p style={{ fontSize:12, color:'rgba(255,255,255,.7)', lineHeight:1.6 }}>
+                1. Open <b>Settings</b> → <b>Safari</b><br/>
+                2. Tap <b>Camera</b> → select <b>Allow</b><br/>
+                3. Come back and reload the page
+              </p>
+            </div>
+
+            <div style={{ background:'rgba(255,255,255,.06)', borderRadius:14, padding:'12px 16px', marginBottom:16, textAlign:'left', maxWidth:300 }}>
+              <p style={{ fontSize:13, fontWeight:700, color:'var(--lime)', marginBottom:8 }}>🤖 Or test with AI sample:</p>
+              <p style={{ fontSize:12, color:'rgba(255,255,255,.7)' }}>Try the scanner with a sample food image</p>
+            </div>
+
+            <button className="btn-primary" style={{ maxWidth: 260 }}
               onClick={captureAndScan} disabled={status === 'scanning' || status === 'capturing'}>
-              {status === 'scanning' ? '🔍 Analysing...' : '🤖 Test with Sample Food'}
+              {status === 'scanning' ? '🔍 Analysing...' : '🤖 Test AI Recognition'}
             </button>
           </div>
         )}
