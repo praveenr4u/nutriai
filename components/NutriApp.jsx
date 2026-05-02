@@ -1087,7 +1087,7 @@ function MainApp({ user, profile, nutrition, foodLog, waterCups, totalCals, tota
       {activeTab === 'home' && (
         <HomeTab foodLog={foodLog} nutrition={nutrition} totalCals={totalCals} totalMacro={totalMacro}
           mealCals={mealCals} waterCups={waterCups} onRemoveFood={onRemoveFood}
-          onOpenFoodModal={onOpenFoodModal} onWaterToggle={onWaterToggle} />
+          onOpenFoodModal={onOpenFoodModal} onWaterToggle={onWaterToggle} user={user} />
       )}
       {activeTab === 'plan' && (
         <PlanTab nutrition={nutrition} planDay={planDay} onDayChange={onPlanDayChange} />
@@ -1125,7 +1125,7 @@ function MainApp({ user, profile, nutrition, foodLog, waterCups, totalCals, tota
 }
 
 // ── HOME TAB ──
-function HomeTab({ foodLog, nutrition, totalCals, totalMacro, mealCals, waterCups, onRemoveFood, onOpenFoodModal, onWaterToggle }) {
+function HomeTab({ foodLog, nutrition, totalCals, totalMacro, mealCals, waterCups, onRemoveFood, onOpenFoodModal, onWaterToggle, user }) {
   const remaining = Math.max(0, nutrition.calorieTarget - totalCals);
   const pct = Math.min(100, (totalCals / nutrition.calorieTarget) * 100);
   const [aiSuggestions, setAiSuggestions] = useState(null);
@@ -1167,7 +1167,7 @@ function HomeTab({ foodLog, nutrition, totalCals, totalMacro, mealCals, waterCup
       <div className="main-header">
         <div>
           <div style={{ fontSize:13, color:'var(--text-mid)', marginBottom:2 }}>
-            {new Date().getHours() < 12 ? 'Good Morning! 🌅' : new Date().getHours() < 17 ? 'Good Afternoon! 🌞' : 'Good Evening! 🌙'}
+            {new Date().getHours() < 12 ? `Good Morning, ${user?.name?.split(' ')[0] || 'there'}! 🌅` : new Date().getHours() < 17 ? `Good Afternoon, ${user?.name?.split(' ')[0] || 'there'}! 🌞` : `Good Evening, ${user?.name?.split(' ')[0] || 'there'}! 🌙`}
           </div>
           <h1>Daily Nutrition</h1>
           <div className="date">{today}</div>
